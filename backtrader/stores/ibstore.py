@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""Interactive Brokers Store Module - IB API connection.
+"""Interactive Brokers Store Module - IB TWS API connection.
 
 This module provides the IBStore for connecting to Interactive Brokers
-TWS or IB Gateway for trading and data.
+TWS or IB Gateway for trading and data, using the official ibapi library
+(EClient + EWrapper pattern).
 
 Classes:
     IBStore: Singleton store for IB connections.
-    IBMessage: IB message handling.
 
 Functions:
     _ts2dt: Converts IB timestamp to datetime.
@@ -18,7 +18,6 @@ Example:
 
 import bisect
 import collections
-import inspect
 import itertools
 import random
 import threading
@@ -26,19 +25,17 @@ import time
 from copy import copy
 from datetime import datetime, timedelta
 
-import ib.opt as ibopt
-from ib.ext.Contract import Contract
+from ibapi.client import EClient
+from ibapi.wrapper import EWrapper
+from ibapi.contract import Contract
+from ibapi.order_cancel import OrderCancel
 
-# Remove MetaParams import since we'll eliminate metaclass usage
-# from backtrader.metabase import MetaParams
 from backtrader.mixins.singleton import ParameterizedSingletonMixin
 
 from ..dataseries import TimeFrame
 from ..position import Position
 from ..utils import UTC, AutoDict
-from ..utils.py3 import bstr, long, queue
-
-bytes = bstr  # py2/3 need for ibpy
+from ..utils.py3 import long, queue
 
 
 def _ts2dt(tstamp=None):
@@ -50,23 +47,10 @@ def _ts2dt(tstamp=None):
             to a datetime object.
 
     Returns:
-        datetime: A datetime object in UTC timezone. If tstamp is provided,
-            it's converted from seconds since epoch with microsecond precision.
-            If not provided, returns current UTC time.
-
-    Note:
-        The original implementation used divisor 1000 (milliseconds), but this
-        was changed to 1 (seconds) to correct time calculation issues. Using
-        1000 resulted in timestamps from 1970 rather than correct current times.
+        datetime: A datetime object in UTC timezone.
     """
-    # Transforms a RTVolume timestamp to a datetime object
-    # Convert timestamp to datetime object, if no timestamp specified, return current UTC time
-    # If timestamp is not None, empty, False, process timestamp and return datetime object
     if not tstamp:
         return datetime.now(UTC)
-    # todo backtrader built-in code, 1000 caused error, changed to 1, this makes calculated UTC time 8 hours behind Beijing time
-    # If using 1000, the time obtained would be from 1970
-    # sec, msec = divmod(long(tstamp), 1000)
     sec, msec = divmod(long(tstamp), 1)
     usec = msec * 1000
     return datetime.fromtimestamp(sec, UTC).replace(microsecond=usec)
@@ -74,8 +58,8 @@ def _ts2dt(tstamp=None):
 
 class RTVolume:
     """Parses a tickString tickType 48 (RTVolume) event from the IB API into its
-    constituent fields
-    Supports using a "price" to simulate an RTVolume from a tickPrice event
+    constituent fields.
+    Supports using a "price" to simulate an RTVolume from a tickPrice event.
     """
 
     _fields = [
@@ -88,449 +72,269 @@ class RTVolume:
     ]
 
     def __init__(self, rtvol="", price=None, tmoffset=None):
-        """Initialize RTVolume from an RTVolume string or simulated data.
-
-        Args:
-            rtvol: String containing RTVolume data from IB API tickString
-                event (tickType 48). Format is semicolon-separated values.
-                If empty, simulates data from individual field values.
-            price: Optional price value. If provided, overrides the price
-                from the rtvol string. Used to simulate RTVolume from
-                tickPrice events.
-            tmoffset: Optional timedelta to add to the datetime. Used for
-                time synchronization between local and IB server time.
-
-        Attributes:
-            price: Price of the tick (float).
-            size: Size/volume of the tick (int).
-            datetime: Timestamp of the tick as datetime object.
-            volume: Total volume (int).
-            vwap: Volume-weighted average price (float).
-            single: Boolean indicating if this is a single tick (bool).
-        """
-        # Use a provided string or simulate a list of empty tokens
-        # Split received tick data
         tokens = iter(rtvol.split(";"))
-
-        # Put the tokens as attributes using the corresponding func
-        # Convert split tick data and assign values, these two code sections are quite concise
         for name, func in self._fields:
             setattr(self, name, func(next(tokens)) if rtvol else func())
-
-        # If price was provided use it
-        # If price is provided separately, use price, will override price received from tick
         if price is not None:
             self.price = price
-        # If time offset is not None, add time offset to existing time
         if tmoffset is not None:
             self.datetime += tmoffset
 
 
-# Decorator to mark methods to register with ib.opt
-def ibregister(f):
-    """Decorator to mark methods for registration with IB's ib.opt message system.
+class _MsgNamespace:
+    """Simple namespace to emulate old IBPy msg objects for broker compatibility.
 
-    This decorator adds a special attribute to methods that indicates they should
-    be registered with the IB API message handlers. The IBStore class scans for
-    methods with this attribute during initialization and automatically registers
-    them to handle corresponding IB API messages.
-
-    Args:
-        f: The function or method to be registered.
-
-    Returns:
-        The same function with an added _ibregister attribute set to True.
-
-    Example:
-        @ibregister
-        def error(self, msg):
-            # Handle error messages from IB
-            pass
+    Provides attribute access plus values()/items() methods that the
+    notification system expects.
     """
-    f._ibregister = True
-    return f
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+    def values(self):
+        return self.__dict__.values()
+
+    def items(self):
+        return self.__dict__.items()
 
 
-class IBStore(ParameterizedSingletonMixin):
-    """Singleton class wrapping an ibpy ibConnection instance.
+class _OrderStateAdapter:
+    """Adapter normalizing ibapi OrderState for broker compatibility.
 
-    This class now uses ParameterizedSingletonMixin instead of MetaSingleton metaclass
-    to implement the singleton pattern. This provides the same functionality without
-    metaclasses while maintaining full backward compatibility.
+    The broker code accesses msg.orderState.status (plain attribute).
+    """
+
+    def __init__(self, order_state):
+        self.status = order_state.status
+        self.initMarginBefore = getattr(order_state, "initMarginBefore", None)
+        self.maintMarginBefore = getattr(order_state, "maintMarginBefore", None)
+        self.equityWithLoanBefore = getattr(order_state, "equityWithLoanBefore", None)
+        self.commissionAndFees = getattr(order_state, "commissionAndFees", None)
+        self.minCommissionAndFees = getattr(order_state, "minCommissionAndFees", None)
+        self.maxCommissionAndFees = getattr(order_state, "maxCommissionAndFees", None)
+        self.commissionAndFeesCurrency = getattr(order_state, "commissionAndFeesCurrency", None)
+        self.warningText = getattr(order_state, "warningText", None)
+
+
+class _ExecutionAdapter:
+    """Adapter normalizing ibapi Execution fields for broker compatibility.
+
+    The broker code accesses execId, orderId, cumQty, shares, side, price, time.
+    The ibapi Execution object already uses these names, but we also expose
+    'commission' from the report when available.
+    """
+
+    def __init__(self, execution):
+        self.execId = execution.execId
+        self.orderId = execution.orderId
+        self.cumQty = execution.cumQty
+        self.shares = execution.shares
+        self.side = execution.side
+        self.price = execution.price
+        self.time = execution.time
+        self.acctNumber = execution.acctNumber
+        self.exchange = execution.exchange
+        self.permId = execution.permId
+        self.clientId = execution.clientId
+        self.liquidation = execution.liquidation
+        self.avgPrice = execution.avgPrice
+        self.orderRef = execution.orderRef
+
+
+class _CommissionReportAdapter:
+    """Adapter normalizing ibapi CommissionAndFeesReport for broker compatibility.
+
+    The broker code accesses execId, commission, realizedPNL.
+    """
+
+    def __init__(self, report):
+        self.execId = report.execId
+        self.commission = report.commissionAndFees
+        self.realizedPNL = report.realizedPNL
+        self.currency = report.currency
+        self.yield_ = report.yield_
+        self.yieldRedemptionDate = report.yieldRedemptionDate
+
+
+class IBStore(ParameterizedSingletonMixin, EWrapper, EClient):
+    """Singleton class wrapping the official IB TWS API (EClient + EWrapper).
+
+    This class inherits from both EWrapper (receives callbacks) and EClient
+    (sends requests), using the standard combined pattern for the IB API.
+    The ParameterizedSingletonMixin provides singleton behavior.
 
     The parameters can also be specified in the classes which use this store,
-    like ``IBData`` and ``IBBroker``
-    # Parameters can also be specified in classes using this store, such as ``IBData`` and ``IBBroker``
+    like ``IBData`` and ``IBBroker``.
+
     Params:
 
       - ``host`` (default:``127.0.0.1``): where IB TWS or IB Gateway are
-        actually running. And although this will usually be the localhost, it
-        must not be
-        # Host address, usually the default host in IB TWS or IB Gateway is localhost, i.e., 127.0.0.1
-        # But this address is not necessarily this default value
+        actually running.
 
       - ``port`` (default: ``7496``): port to connect to. The demo system uses
         ``7497``
-        # Port number, usually real account is 7496, demo account is 7497
+
       - ``clientId`` (default: ``None``): which clientId to use to connect to
-        TWS.
-        ``None``: generates a random id between 1 and 65535
+        TWS. ``None``: generates a random id between 1 and 65535.
         An ``integer``: will be passed as the value to use.
-        # Set a clientid to connect to TWS, needed for multi-account management to know which id sent signal
-        # Can get each id's status through masterid, if set to None, will generate random number between 1 and 65535
 
-      - ``notifyall`` (default: ``False``)
+      - ``notifyall`` (default: ``False``): If ``False`` only ``error``
+        messages will be sent to the ``notify_store`` methods of ``Cerebro``
+        and ``Strategy``. If ``True``, each and every message received from
+        TWS will be notified.
 
-        If ``False`` only ``error`` messages will be sent to the
-        ``notify_store`` methods of ``Cerebro`` and ``Strategy``.
-        If ``True``, each and every message received from TWS will be notified
-        # When this parameter is set to False, only error message types will be passed to notify_store
-        # If this parameter is set to True, all messages will be passed to notify_store
+      - ``_debug`` (default: ``False``): Print all messages received from TWS
+        to standard output.
 
-      - ``_debug`` (default: ``False``)
-        Print all messages received from TWS to standard output
-        # Print all messages received from TWS to standard output. Default is not to do this, when set to True, will print all messages
-      - ``reconnect`` (default: ``3``)
-        Number of attempts to try to reconnect after the 1st connection attempt
-        fails
-        Set it to a ``-1`` value to keep on reconnecting forever
-        # Number of reconnection attempts after first connection attempt fails; default is 3 times, if set to -1, will keep trying to reconnect after connection fails
+      - ``reconnect`` (default: ``3``): Number of attempts to try to reconnect
+        after the 1st connection attempt fails. Set it to ``-1`` to keep on
+        reconnecting forever.
 
-      - ``timeout`` (default: ``3.0``)
+      - ``timeout`` (default: ``3.0``): Time in seconds between reconnection
+        attempts.
 
-        Time in seconds between reconnection attemps
-        # Seconds between each reconnection attempt, default is 3 seconds
+      - ``timeoffset`` (default: ``True``): If True, the time obtained from
+        ``reqCurrentTime`` (IB Server time) will be used to calculate the
+        offset to localtime and this offset will be used for the price
+        notifications.
 
-      - ``timeoffset`` (default: ``True``)
+      - ``timerefresh`` (default: ``60.0``): Time in seconds: how often the
+        time offset has to be refreshed.
 
-        If True, the time obtained from ``reqCurrentTime`` (IB Server time)
-        will be used to calculate the offset to localtime and this offset will
-        be used for the price notifications (tickPrice events, for example for
-        CASH markets) to modify the locally calculated timestamp.
-
-        The time offset will propagate to other parts of the ``backtrader``
-        ecosystem like the **resampling** to align resampling timestamps using
-        the calculated offset.
-
-        # If set to True, use time requested from IB server via reqCurrentTime method to calculate time difference with local time,
-        # use this time difference to correct local timestamp when doing price notifications, and this time difference will be
-        # propagated to backtrader ecosystem, such as resample function
-
-      - ``timerefresh`` (default: ``60.0``)
-
-        Time in seconds: how often the time offset has to be refreshed
-
-        # How often to calculate the time difference between IB server and local time. Default is every 60 seconds
-
-      - ``indcash`` (default: ``True``)
-
-        Manage IND codes as if they were cash for price retrieval
-        # For price retrieval of cash, used to manage IND codes
-        # todo Haven't fully understood the meaning of this parameter
+      - ``indcash`` (default: ``True``): Manage IND codes as if they were cash
+        for price retrieval.
     """
-
-    # Set a base for the data requests (historical/realtime) to distinguish the
-    # id in the error notifications from orders, where the basis (usually
-    # starting at 1) is set by TWS
 
     REQIDBASE = 0x01000000
 
     BrokerCls = None  # broker class will autoregister
     DataCls = None  # data class will auto register
 
-    # todo Moved class attributes added after code init to before init
-
-    # The _durations are meant to calculate the necessary historical data to
-    # perform backfilling at the start of a connetion or a connection is lost.
-    # Using a timedelta as a key allows quickly finding out which
-    # bar size (values in the tuples int the dict) can be used.
-    # This attribute is mainly used to quickly calculate how many bars need to be filled when backfilling historical data
-
     _durations = dict(
         [
-            # 60 seconds - 1 min
             ("60 S", ("1 secs", "5 secs", "10 secs", "15 secs", "30 secs", "1 min")),
-            # 120 seconds - 2 mins
             ("120 S", ("1 secs", "5 secs", "10 secs", "15 secs", "30 secs", "1 min", "2 mins")),
-            # 180 seconds - 3 mins
             (
                 "180 S",
                 ("1 secs", "5 secs", "10 secs", "15 secs", "30 secs", "1 min", "2 mins", "3 mins"),
             ),
-            # 300 seconds - 5 mins
             (
                 "300 S",
                 (
-                    "1 secs",
-                    "5 secs",
-                    "10 secs",
-                    "15 secs",
-                    "30 secs",
-                    "1 min",
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
+                    "1 secs", "5 secs", "10 secs", "15 secs", "30 secs",
+                    "1 min", "2 mins", "3 mins", "5 mins",
                 ),
             ),
-            # 600 seconds - 10 mins
             (
                 "600 S",
                 (
-                    "1 secs",
-                    "5 secs",
-                    "10 secs",
-                    "15 secs",
-                    "30 secs",
-                    "1 min",
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
+                    "1 secs", "5 secs", "10 secs", "15 secs", "30 secs",
+                    "1 min", "2 mins", "3 mins", "5 mins", "10 mins",
                 ),
             ),
-            # 900 seconds - 15 mins
             (
                 "900 S",
                 (
-                    "1 secs",
-                    "5 secs",
-                    "10 secs",
-                    "15 secs",
-                    "30 secs",
-                    "1 min",
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
-                    "15 mins",
+                    "1 secs", "5 secs", "10 secs", "15 secs", "30 secs",
+                    "1 min", "2 mins", "3 mins", "5 mins", "10 mins", "15 mins",
                 ),
             ),
-            # 1200 seconds - 20 mins
             (
                 "1200 S",
                 (
-                    "1 secs",
-                    "5 secs",
-                    "10 secs",
-                    "15 secs",
-                    "30 secs",
-                    "1 min",
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
-                    "15 mins",
-                    "20 mins",
+                    "1 secs", "5 secs", "10 secs", "15 secs", "30 secs",
+                    "1 min", "2 mins", "3 mins", "5 mins", "10 mins",
+                    "15 mins", "20 mins",
                 ),
             ),
-            # 1800 seconds - 30 mins
             (
                 "1800 S",
                 (
-                    "1 secs",
-                    "5 secs",
-                    "10 secs",
-                    "15 secs",
-                    "30 secs",
-                    "1 min",
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
-                    "15 mins",
-                    "20 mins",
-                    "30 mins",
+                    "1 secs", "5 secs", "10 secs", "15 secs", "30 secs",
+                    "1 min", "2 mins", "3 mins", "5 mins", "10 mins",
+                    "15 mins", "20 mins", "30 mins",
                 ),
             ),
-            # 3600 seconds - 1 hour
             (
                 "3600 S",
                 (
-                    "5 secs",
-                    "10 secs",
-                    "15 secs",
-                    "30 secs",
-                    "1 min",
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
-                    "15 mins",
-                    "20 mins",
-                    "30 mins",
-                    "1 hour",
+                    "5 secs", "10 secs", "15 secs", "30 secs",
+                    "1 min", "2 mins", "3 mins", "5 mins", "10 mins",
+                    "15 mins", "20 mins", "30 mins", "1 hour",
                 ),
             ),
-            # 7200 seconds - 2 hours
             (
                 "7200 S",
                 (
-                    "5 secs",
-                    "10 secs",
-                    "15 secs",
-                    "30 secs",
-                    "1 min",
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
-                    "15 mins",
-                    "20 mins",
-                    "30 mins",
-                    "1 hour",
-                    "2 hours",
+                    "5 secs", "10 secs", "15 secs", "30 secs",
+                    "1 min", "2 mins", "3 mins", "5 mins", "10 mins",
+                    "15 mins", "20 mins", "30 mins", "1 hour", "2 hours",
                 ),
             ),
-            # 10,800 seconds - 3 hours
             (
                 "10800 S",
                 (
-                    "10 secs",
-                    "15 secs",
-                    "30 secs",
-                    "1 min",
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
-                    "15 mins",
-                    "20 mins",
-                    "30 mins",
-                    "1 hour",
-                    "2 hours",
-                    "3 hours",
+                    "10 secs", "15 secs", "30 secs",
+                    "1 min", "2 mins", "3 mins", "5 mins", "10 mins",
+                    "15 mins", "20 mins", "30 mins", "1 hour", "2 hours", "3 hours",
                 ),
             ),
-            # 14,400 seconds - 4 hours
             (
                 "14400 S",
                 (
-                    "15 secs",
-                    "30 secs",
-                    "1 min",
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
-                    "15 mins",
-                    "20 mins",
-                    "30 mins",
-                    "1 hour",
-                    "2 hours",
-                    "3 hours",
-                    "4 hours",
+                    "15 secs", "30 secs",
+                    "1 min", "2 mins", "3 mins", "5 mins", "10 mins",
+                    "15 mins", "20 mins", "30 mins", "1 hour", "2 hours",
+                    "3 hours", "4 hours",
                 ),
             ),
-            # 28,800 seconds - 8 hours
             (
                 "28800 S",
                 (
                     "30 secs",
-                    "1 min",
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
-                    "15 mins",
-                    "20 mins",
-                    "30 mins",
-                    "1 hour",
-                    "2 hours",
-                    "3 hours",
-                    "4 hours",
-                    "8 hours",
+                    "1 min", "2 mins", "3 mins", "5 mins", "10 mins",
+                    "15 mins", "20 mins", "30 mins", "1 hour", "2 hours",
+                    "3 hours", "4 hours", "8 hours",
                 ),
             ),
-            # 1 day
             (
                 "1 D",
                 (
-                    "1 min",
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
-                    "15 mins",
-                    "20 mins",
-                    "30 mins",
-                    "1 hour",
-                    "2 hours",
-                    "3 hours",
-                    "4 hours",
-                    "8 hours",
-                    "1 day",
+                    "1 min", "2 mins", "3 mins", "5 mins", "10 mins",
+                    "15 mins", "20 mins", "30 mins", "1 hour", "2 hours",
+                    "3 hours", "4 hours", "8 hours", "1 day",
                 ),
             ),
-            # 2 days
             (
                 "2 D",
                 (
-                    "2 mins",
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
-                    "15 mins",
-                    "20 mins",
-                    "30 mins",
-                    "1 hour",
-                    "2 hours",
-                    "3 hours",
-                    "4 hours",
-                    "8 hours",
-                    "1 day",
+                    "2 mins", "3 mins", "5 mins", "10 mins",
+                    "15 mins", "20 mins", "30 mins", "1 hour", "2 hours",
+                    "3 hours", "4 hours", "8 hours", "1 day",
                 ),
             ),
-            # 1 week
             (
                 "1 W",
                 (
-                    "3 mins",
-                    "5 mins",
-                    "10 mins",
-                    "15 mins",
-                    "20 mins",
-                    "30 mins",
-                    "1 hour",
-                    "2 hours",
-                    "3 hours",
-                    "4 hours",
-                    "8 hours",
-                    "1 day",
-                    "1 W",
+                    "3 mins", "5 mins", "10 mins",
+                    "15 mins", "20 mins", "30 mins", "1 hour", "2 hours",
+                    "3 hours", "4 hours", "8 hours", "1 day", "1 W",
                 ),
             ),
-            # 2 weeks
             (
                 "2 W",
                 (
-                    "15 mins",
-                    "20 mins",
-                    "30 mins",
-                    "1 hour",
-                    "2 hours",
-                    "3 hours",
-                    "4 hours",
-                    "8 hours",
-                    "1 day",
-                    "1 W",
+                    "15 mins", "20 mins", "30 mins", "1 hour", "2 hours",
+                    "3 hours", "4 hours", "8 hours", "1 day", "1 W",
                 ),
             ),
-            # 1 month
             (
                 "1 M",
                 (
-                    "30 mins",
-                    "1 hour",
-                    "2 hours",
-                    "3 hours",
-                    "4 hours",
-                    "8 hours",
-                    "1 day",
-                    "1 W",
-                    "1 M",
+                    "30 mins", "1 hour", "2 hours", "3 hours", "4 hours",
+                    "8 hours", "1 day", "1 W", "1 M",
                 ),
             ),
-            # 2+ months
             ("2 M", ("1 day", "1 W", "1 M")),
             ("3 M", ("1 day", "1 W", "1 M")),
             ("4 M", ("1 day", "1 W", "1 M")),
@@ -541,13 +345,10 @@ class IBStore(ParameterizedSingletonMixin):
             ("9 M", ("1 day", "1 W", "1 M")),
             ("10 M", ("1 day", "1 W", "1 M")),
             ("11 M", ("1 day", "1 W", "1 M")),
-            # 1+ years
             ("1 Y", ("1 day", "1 W", "1 M")),
         ]
     )
 
-    # Sizes allow for quick translation from bar sizes above to actual
-    # timeframes to make a comparison with the actual data
     _sizes = {
         "secs": (TimeFrame.Seconds, 1),
         "min": (TimeFrame.Minutes, 1),
@@ -583,351 +384,177 @@ class IBStore(ParameterizedSingletonMixin):
     @classmethod
     def getdata(cls, *args, **kwargs):
         """Returns ``DataCls`` with args, kwargs"""
-        # Class method, get data
         return cls.DataCls(*args, **kwargs)
 
     @classmethod
     def getbroker(cls, *args, **kwargs):
         """Returns broker with *args, **kwargs from registered ``BrokerCls``"""
-        # Class method, get broker
         return cls.BrokerCls(*args, **kwargs)
 
     def __init__(self):
-        """Initialize the IBStore instance.
+        ParameterizedSingletonMixin.__init__(self)
+        EClient.__init__(self, wrapper=self)
 
-        Sets up the IB connection, threading locks, queues, and internal data
-        structures for managing data feeds, broker operations, account updates,
-        and message handling. This is a singleton class that maintains a single
-        connection to IB TWS or Gateway.
+        self._lock_q = threading.Lock()
+        self._lock_accupd = threading.Lock()
+        self._lock_pos = threading.Lock()
+        self._lock_notif = threading.Lock()
 
-        The initialization:
-        1. Creates locks for thread-safe access to shared resources
-        2. Sets up events for tracking connection state
-        3. Initializes data structures for queues, ticker IDs, positions
-        4. Generates or uses provided clientId for IB connection
-        5. Creates ibpy connection object
-        6. Registers message handlers for IB API callbacks
-        7. Builds duration/size lookup tables for historical data requests
-        """
-        # Initialize IBStore
-        super().__init__()
-        # Create 4 threads and add locks
-        self._lock_q = threading.Lock()  # sync access to _tickerId/Queues
-        self._lock_accupd = threading.Lock()  # sync account updates
-        self._lock_pos = threading.Lock()  # sync position updates
-        self._lock_notif = threading.Lock()  # sync access to notif queue
-
-        # Account list received
-        # Create two event management flags for account
         self._event_managed_accounts = threading.Event()
         self._event_accdownload = threading.Event()
-        # Not reconnecting, default is False
-        self.dontreconnect = False  # for non-recoverable connect errors
-        # cerebro pointer, used to generate notifications
-        self._env = None  # reference to cerebro for general notifications
-        # broker instance, default is None
-        self.broker = None  # broker instance
-        # data, default is an empty list
-        self.datas = list()  # datas that have registered over start
-        # Request start from data or cerebro
-        self.ccount = 0  # requests to start (from cerebro or datas)
-        # Create a thread and lock, used for time difference or time compensation
-        self._lock_tmoffset = threading.Lock()
-        # Time difference or time compensation, default is a time difference value
-        self.tmoffset = timedelta()  # to control time difference with server
 
-        # Structures to hold datas requests
-        # Data structure to save data requests
+        self.dontreconnect = False
+        self._env = None
+        self.broker = None
+        self.datas = list()
+        self.ccount = 0
+
+        self._lock_tmoffset = threading.Lock()
+        self.tmoffset = timedelta()
+
+        # Structures to hold data requests
         self.qs = collections.OrderedDict()  # key: tickerId -> queues
         self.ts = collections.OrderedDict()  # key: queue -> tickerId
-        self.iscash = dict()  # tickerIds from cash products (for ex: EUR.JPY)
+        self.iscash = dict()  # tickerIds from cash products
         self.histexreq = dict()  # holds segmented historical requests
         self.histfmt = dict()  # holds datetimeformat for request
         self.histsend = dict()  # holds sessionend (data time) for request
-        self.histtz = dict()  # holds sessionend (data time) for request
+        self.histtz = dict()  # holds timezone for request
 
-        # Data structure to save account information
-        self.acc_cash = AutoDict()  # current total cash per account
-        self.acc_value = AutoDict()  # current total value per account
-        self.acc_upds = AutoDict()  # current account valueinfos per account
+        self.acc_cash = AutoDict()
+        self.acc_value = AutoDict()
+        self.acc_upds = AutoDict()
 
-        self.port_update = False  # indicate whether to signal to broker
+        self.port_update = False
 
-        self.positions = collections.defaultdict(Position)  # actual positions
-        # todo Haven't understood why count can use self.REQIDBASE as parameter, using it directly causes error
-        self._tickerId = itertools.count(self.REQIDBASE)  # unique tickerIds
-        self.orderid = None  # next possible orderid (will be itertools.count)
-        # Save cdetails request information
-        self.cdetails = collections.defaultdict(list)  # hold cdetails requests
-        # Manage accounts
-        self.managed_accounts = list()  # received via managedAccounts
-        # Notification information, saved using a queue
-        self.notifs = queue.Queue()  # store notifications for cerebro
+        self.positions = collections.defaultdict(Position)
+        self._tickerId = itertools.count(self.REQIDBASE)
+        self.orderid = None
+        self.cdetails = collections.defaultdict(list)
+        self.managed_accounts = list()
+        self.notifs = queue.Queue()
 
-        # Use the provided clientId or a random one
-        # Generate clientId
         if self.p.clientId is None:
-            self.clientId = random.randint(1, pow(2, 16) - 1)
+            self._bt_clientId = random.randint(1, pow(2, 16) - 1)
         else:
-            self.clientId = self.p.clientId
+            self._bt_clientId = self.p.clientId
 
-        # ibpy connection object
-        # Use ibpy to connect to IB
-        self.conn = ibopt.ibConnection(host=self.p.host, port=self.p.port, clientId=self.clientId)
+        self._ever_connected = False
+        self._msg_thread = None
 
-        # register a printall method if requested
-        # If in debug mode or notify all information mode, register self.watcher to the connection
-        if self.p._debug or self.p.notifyall:
-            self.conn.registerAll(self.watcher)
-
-        # Register decorated methods with conn
-        # Get all methods on the connection
-        methods = inspect.getmembers(self, inspect.ismethod)
-        for name, method in methods:
-            # If this method is not registerable, ignore
-            if not getattr(method, "_ibregister", False):
-                continue
-            # If this method is registerable
-            message = getattr(ibopt.message, name)
-            # Then register this method
-            self.conn.register(method, message)
-
-        # These two functions are mainly used to quickly calculate how many bars are needed when backfilling data
-
-        # This utility key function transforms a barsize into a:
-        #   (Timeframe, Compression) tuple which can be sorted
-        # Split bar size, for example "3 mins", returns result (TimeFrame.Minutes, 3)
+        # Build duration/size lookup tables
         def keyfn(x):
             n, t = x.split()
             tf, comp = self._sizes[t]
             return (tf, int(n) * comp)
 
-        # This utility key function transforms a duration into a:
-        #   (Timeframe, Compression) tuple which can be sorted
-        # Split and convert time interval, for example 1 D, returns result (TimeFrame.Days, 1)
         def key2fn(x):
             n, d = x.split()
             tf = self._dur2tf[d]
             return (tf, int(n))
 
-        # Generate a table of reverse durations
         self.revdur = collections.defaultdict(list)
-        # The table (dict) is a ONE-to-MANY relation of
-        #   duration -> barsizes
-        # Here it is reversed to get a ONE-to-MANY relation of
-        #   barsize -> durations
         for duration, barsizes in self._durations.items():
             for barsize in barsizes:
                 self.revdur[keyfn(barsize)].append(duration)
 
-        # Once managed, sort the durations according to real duration and not
-        # to the text form using the utility key above
         for barsize in self.revdur:
             self.revdur[barsize].sort(key=key2fn)
 
-    # Start
+    # ---------------------------------------------------------------
+    # Lifecycle management
+    # ---------------------------------------------------------------
+
     def start(self, data=None, broker=None):
-        """Start the IBStore connection and associated data feeds or broker.
+        """Start the IBStore connection and associated data feeds or broker."""
+        self.reconnect(fromstart=True)
 
-        Args:
-            data: Optional data feed instance. If provided, stores the reference
-                and returns a queue for data delivery.
-            broker: Optional broker instance. If provided, stores the reference
-                for order management.
-
-        Returns:
-            If data is provided, returns a queue for receiving data updates.
-            Otherwise, returns None.
-
-        Note:
-            This method triggers a reconnection attempt. If connection fails,
-            the returned queue will contain None to signal the data feed to
-            handle the failure.
-        """
-        self.reconnect(fromstart=True)  # reconnect should be an invariant
-
-        # Datas require some processing to kickstart data reception
         if data is not None:
             self._env = data._env
-            # For datas simulate a queue with None to kickstart co
             self.datas.append(data)
-
-            # if the connection fails, get a fake registration that will force the
-            # datas to try to reconnect or else bail out
             return self.getTickerQueue(start=True)
 
         elif broker is not None:
             self.broker = broker
 
-    # Stop
     def stop(self):
-        """Stop the IBStore connection and cleanup resources.
-
-        Disconnects from IB TWS/Gateway and unblocks any threads waiting on
-        connection events. This is an invariant method that can be called
-        multiple times safely.
-        """
+        """Stop the IBStore connection and cleanup resources."""
         try:
-            self.conn.disconnect()  # disconnect should be an invariant
-        except AttributeError:
-            pass  # conn may have never been connected and lack "disconnect".
-
-        # Unblock any calls set on these events
-        self._event_managed_accounts.set()
-        self._event_accdownload.set()
-
-    # Print information to standard output
-    def logmsg(self, *args):
-        """Log messages to standard output when debug mode is enabled.
-
-        Args:
-            *args: Variable length argument list to be printed.
-
-        Note:
-            Messages are only printed if the _debug parameter is True.
-            Used for debugging and monitoring IB API communication.
-        """
-        # for logging purposes
-        if self.p._debug:
-            print(*args)
-
-    # After registration, if in debug mode, will print all messages,
-    # if in notify all information mode, will pass all messages to notification
-    def watcher(self, msg):
-        """Watch and process all IB API messages when registered.
-
-        This method is registered to receive all messages from IB if debug mode
-        or notifyall mode is enabled. It logs messages and optionally queues them
-        for notification to cerebro/strategy.
-
-        Args:
-            msg: IB API message object received from TWS/Gateway.
-
-        Note:
-            Only registered if _debug or notifyall parameters are True.
-            When notifyall is True, messages are stored in the notification queue
-            for retrieval by Cerebro's get_notifications method.
-        """
-        # will be registered to see all messages if debug is requested
-        self.logmsg(str(msg))
-        if self.p.notifyall:
-            self.notifs.put((msg, tuple(msg.values()), dict(msg.items())))
-
-    # Used to determine if already connected to TWS or IB
-    def connected(self):
-        """Check if currently connected to IB TWS or Gateway.
-
-        Returns:
-            bool: True if connected to IB, False otherwise. Returns False if
-                the connection object doesn't exist or hasn't been initialized.
-
-        Note:
-            The isConnected method is accessed through __getattr__ indirections
-            and may not be present if the connection hasn't been established.
-            AttributeError is caught to handle this case gracefully.
-        """
-        # The isConnected method is available through __getattr__ indirections
-        # and may not be present, which indicates that no connection has been
-        # made because the subattribute sender has not yet been created, hence
-        # the check for the AttributeError exception
-        try:
-            return self.conn.isConnected()
+            self.disconnect()
         except AttributeError:
             pass
 
-        return False  # non-connected (including non-initialized)
+        self._event_managed_accounts.set()
+        self._event_accdownload.set()
 
-    # Reconnection method, this method must be an invariant, convenient to call many times
+    def logmsg(self, *args):
+        """Log messages to standard output when debug mode is enabled."""
+        if self.p._debug:
+            print(*args)
+
+    def connected(self):
+        """Check if currently connected to IB TWS or Gateway."""
+        try:
+            return self.isConnected()
+        except AttributeError:
+            pass
+        return False
+
     def reconnect(self, fromstart=False, resub=False):
         """Attempt to connect or reconnect to IB TWS/Gateway with retry logic.
 
-        This is an invariant method that can be called multiple times safely.
-        Implements reconnection policy with configurable retry attempts and timeouts.
-
         Args:
             fromstart: If True, indicates this is the initial connection attempt.
-                If False and connection succeeds, will restart data subscriptions.
             resub: If True, restarts data subscriptions when connection succeeds.
 
         Returns:
             bool: True if connection is successful, False if all retry attempts
                 fail or if dontreconnect flag is set.
-
-        Note:
-            Connection policy:
-            * If dontreconnect is True, returns False immediately
-            * Checks current connection status (first connection adds 1 to retries)
-            * Retries indefinitely if reconnect parameter is -1
-            * Retries specified number of times if reconnect parameter > 0
-            * Waits timeout seconds between retry attempts
-            * On success, restarts data subscriptions unless fromstart is True
         """
-        # This method must be an invariant in which it can be called several
-        # times from the same source and must be consistent.
-        # An example would
-        # be five data that are being received simultaneously, and all request a
-        # reconnecting
-
-        # Policy:
-        #  - if dontreconnect has been set, no option to connect is possible
-        #  - check connection and use the absence of isConnected as signal of
-        #    first ever connection (add 1 to retries too)
-        #  - Calculate the retries (forever or not)
-        #  - Try to connect
-        #  - If achieved and fromstart is false, the datas will be
-        #    re-kickstarted to recreate the subscription
-
-        # Set first connection to False, if currently connected and resub is True,
-        # will call self.startdatas() and return True
-        # If cannot get connection status, directly set firstconnect to True
-        firstconnect = False
-        try:
-            if self.conn.isConnected():
+        firstconnect = not self._ever_connected
+        if not firstconnect:
+            if self.isConnected():
                 if resub:
                     self.startdatas()
-                return True  # nothing to do
-        except AttributeError:
-            # Not connected, several __getattr__ indirections to
-            # self.conn.sender.client.isConnected
-            firstconnect = True
-        # If not allowing reconnection, when reconnect is called, directly return False
+                return True
+
         if self.dontreconnect:
             return False
 
-        # This is only invoked from the main thread by datas, and therefore no
-        # lock is needed to control synchronicity to it
-        # Get number of retry attempts, if attempts >= 0, add 1 to attempts (True=1)
         retries = self.p.reconnect
         if retries >= 0:
             retries += firstconnect
-        # If attempts < 0 or attempts > 0, will stay in while loop until attempts equals 0
+
         while retries < 0 or retries:
-            # If not first connection attempt, rest timeout seconds then retry connection
             if not firstconnect:
                 time.sleep(self.p.timeout)
-            # Set firstconnect to False, for continuing to rest on next connection
             firstconnect = False
-            # If connection successful, if fromstart is False or resub is True,
-            # will call self.startdatas(), then return True
-            if self.conn.connect():
+
+            try:
+                EClient.connect(self, self.p.host, self.p.port, self._bt_clientId)
+            except Exception:
+                pass
+
+            if self.isConnected():
+                self._ever_connected = True
+
+                self._msg_thread = threading.Thread(
+                    target=self.run, daemon=True, name="IBStore-MsgLoop"
+                )
+                self._msg_thread.start()
+
                 if not fromstart or resub:
                     self.startdatas()
-                return True  # connection successful
-            # If retries > 0, subtract 1 until equal to 0 to exit loop, or return
+                return True
+
             if retries > 0:
                 retries -= 1
-        # If reconnection fails in the end, set dontreconnect to True and return False, indicating reconnection was not successful
+
         self.dontreconnect = True
-        return False  # connection/reconnection failed
+        return False
 
-    # Request subscription data
     def startdatas(self):
-        """Start data subscriptions for all registered data feeds.
-
-        Creates threads to request data from IB for each registered data feed.
-        Waits for all data requests to complete before returning.
-        """
-        # kickstrat datas, not returning until all of them have been done
+        """Start data subscriptions for all registered data feeds."""
         ts = list()
         for data in self.datas:
             t = threading.Thread(target=data.reqdata)
@@ -937,14 +564,8 @@ class IBStore(ParameterizedSingletonMixin):
         for t in ts:
             t.join()
 
-    # Stop subscription data, and pop data in LIFO order
     def stopdatas(self):
-        """Stop data subscriptions for all registered data feeds.
-
-        Cancels data requests and puts None in all queues in LIFO (last-in-first-out)
-        order to signal data feeds to stop waiting for data.
-        """
-        # stop subs and force datas out of the loop (in LIFO order)
+        """Stop data subscriptions for all registered data feeds."""
         qs = list(self.qs.values())
         ts = list()
         for data in self.datas:
@@ -958,290 +579,372 @@ class IBStore(ParameterizedSingletonMixin):
         for q in reversed(qs):  # datamaster the last one to get a None
             q.put(None)
 
-    # Get notification information in queue
     def get_notifications(self):
-        """Return the pending "store" notifications"""
-        # The background thread could keep on adding notifications. The None
-        # mark allows to identify which is the last notification to deliver
-        self.notifs.put(None)  # put a mark
+        """Return the pending "store" notifications."""
+        self.notifs.put(None)
         notifs = list()
         while True:
             notif = self.notifs.get()
-            if notif is None:  # mark is reached
+            if notif is None:
                 break
             notifs.append(notif)
-
         return notifs
 
-    # Register related error information
-    @ibregister
-    def error(self, msg):
+    # ---------------------------------------------------------------
+    # EWrapper callback overrides
+    # ---------------------------------------------------------------
+
+    def error(self, reqId, errorTime, errorCode, errorString,
+              advancedOrderRejectJson=""):
         """Handle error messages from IB API.
 
-        Processes error codes and takes appropriate action based on error type.
-        Many IB errors are informational rather than critical errors.
-
-        Args:
-            msg: IB error message object containing errorCode, errorMsg, and id fields.
-
-        Note:
-            Error code ranges:
-            * 100-199: Order/Data/Historical related
-            * 200-203: tickerId and Order Related (security not found/not allowed)
-            * 300-399: Orders, connectivity, tickers, misc errors
-            * 400-449: Order related
-            * 500-531: Connectivity/Communication Errors
-            * 10000-100027: Special orders/routing
-            * 1100-1102: TWS connectivity to outside
-            * 1300: Socket dropped in client-TWS communication
-            * 2100-2110: Data Farm status (id=-1)
-
-            All errors are logged to notification queue unless notifyall is True
-            (in which case watcher already logged them).
+        Maps the modern ibapi error callback (with direct parameters) into
+        the existing queue-based notification and error-handling logic.
         """
-        # 100-199 Order/Data/Historical related
-        # 200-203 tickerId and Order Related
-        # 300-399 A mix of things: orders, connectivity, tickers, misc errors
-        # 400-449 Seem order related again
-        # 500-531 Connectivity/Communication Errors
-        # 10000-100027 Mix of special orders/routing
-        # 1100-1102 TWS connectivy to the outside
-        # 1300- Socket dropped in client-TWS communication
-        # 2100-2110 Informative about Data Farm status (id=-1)
+        msg = _MsgNamespace(
+            id=reqId,
+            errorCode=errorCode,
+            errorMsg=errorString,
+            errorTime=errorTime,
+        )
 
-        # All errors are logged to the environment (cerebro), because many
-        # errors in Interactive Brokers are actually informational and many may
-        # actually be of interest to the user
-        # This place seems to complement the original function, causing all messages to be put in self.notifs
-        # regardless of notifyall parameter
-        # todo Come back to confirm whether there is an error here
+        self.logmsg(
+            f"IB Error reqId={reqId} code={errorCode}: {errorString}"
+        )
+
         if not self.p.notifyall:
             self.notifs.put((msg, tuple(msg.values()), dict(msg.items())))
 
-        # Manage those events which have to do with connection
-        if msg.errorCode is None:
-            # Usually received as an error in connection of just before disconn
+        if errorCode is None:
             pass
-        elif msg.errorCode in [200, 203, 162, 320, 321, 322]:
-            # cdetails 200 security isn't found, notify over right queue
-            # cdetails 203 security not allowed for acct
+        elif errorCode in [200, 203, 162, 320, 321, 322]:
             try:
-                q = self.qs[msg.id]
+                q = self.qs[reqId]
             except KeyError:
-                pass  # should not happend but it can
+                pass
             else:
                 self.cancelQueue(q, True)
 
-        elif msg.errorCode in [354, 420]:
-            # 354 no subscription, 420 no real-time bar for contract
-            # the calling data to let the data know ... it cannot resub
+        elif errorCode in [354, 420]:
             try:
-                q = self.qs[msg.id]
+                q = self.qs[reqId]
             except KeyError:
-                pass  # should not happend but it can
+                pass
             else:
-                q.put(-msg.errorCode)
+                q.put(-errorCode)
                 self.cancelQueue(q)
 
-        elif msg.errorCode == 10225:
-            # 10225-Bust event occurred, current subscription is deactivated.
-            # Please resubscribe real-time bars immediately.
+        elif errorCode == 10225:
             try:
-                q = self.qs[msg.id]
+                q = self.qs[reqId]
             except KeyError:
-                pass  # should not happend but it can
+                pass
             else:
-                q.put(-msg.errorCode)
+                q.put(-errorCode)
 
-        elif msg.errorCode == 326:  # not recoverable, clientId in use
+        elif errorCode == 326:  # not recoverable, clientId in use
             self.dontreconnect = True
-            self.conn.disconnect()
-            self.stopdatas()
+            self.disconnect()
 
-        elif msg.errorCode == 502:
-            # Cannot connect to TWS: port, config not open, tws off (504 then)
-            self.conn.disconnect()
-            self.stopdatas()
+        elif errorCode == 502:
+            self.disconnect()
 
-        elif msg.errorCode == 504:  # Not Connected for data op
-            # Once for each data
-            pass  # don't need to manage it
+        elif errorCode == 504:  # Not Connected for data op
+            pass
 
-        elif msg.errorCode == 1300:
-            # TWS has been closed. The port for a new connection is there
-            # newport = int(msg.errorMsg.split('-')[-1])  # bla bla bla -7496
-            self.conn.disconnect()
-            self.stopdatas()
+        elif errorCode == 1300:
+            self.disconnect()
 
-        elif msg.errorCode == 1100:
-            # Connection lost - Notify ... datas will wait on the queue
-            # with no messages arriving
-            for q in self.ts:  # key: queue -> ticker
-                q.put(-msg.errorCode)
+        elif errorCode == 1100:
+            for q in self.ts:
+                q.put(-errorCode)
 
-        elif msg.errorCode == 1101:
-            # Connection restored and tickerIds are gone
-            for q in self.ts:  # key: queue -> ticker
-                q.put(-msg.errorCode)
+        elif errorCode == 1101:
+            for q in self.ts:
+                q.put(-errorCode)
 
-        elif msg.errorCode == 1102:
-            # Connection restored and tickerIds maintained
-            for q in self.ts:  # key: queue -> ticker
-                q.put(-msg.errorCode)
+        elif errorCode == 1102:
+            for q in self.ts:
+                q.put(-errorCode)
 
-        elif msg.errorCode < 500:
-            # Given the myriad of errorCodes, start by assuming is an order
-            # error and if not, the checks there will let it go
-            if msg.id < self.REQIDBASE:
+        elif errorCode < 500:
+            if reqId < self.REQIDBASE:
                 if self.broker is not None:
                     self.broker.push_ordererror(msg)
             else:
-                # Cancel the queue if a "data" reqId error is given: sanity
-                q = self.qs[msg.id]
+                q = self.qs[reqId]
                 self.cancelQueue(q, True)
 
-    # Close connection
-    @ibregister
-    def connectionClosed(self, msg):
-        """Handle connection closed message from IB API.
+    def connectionClosed(self):
+        """Handle connection closed event from IB API.
 
-        Sometimes this message arrives without accompanying error codes like
-        1300 or 502, so it needs to be handled independently.
-
-        Args:
-            msg: Connection closed message from IB API.
+        Called by EClient.disconnect() or when TWS closes the connection.
+        We only stop datas here; disconnect cleanup is handled by EClient.
         """
-        # Sometimes this comes without 1300/502 or any other and will not be
-        # seen in error, hence the need to manage the situation independently
-        self.conn.disconnect()
         self.stopdatas()
 
-    # Manage accounts
-    @ibregister
-    def managedAccounts(self, msg):
-        """Handle managed accounts message from IB API.
-
-        This is typically the first message received after connection.
-        Parses the list of managed account codes and triggers time synchronization.
-
-        Args:
-            msg: Message containing accountsList field with comma-separated account codes.
-
-        Note:
-            Sets the _event_managed_accounts event to unblock other threads waiting
-            for account information. Also requests current time from IB server to
-            calculate time offset for accurate timestamping.
-        """
-        # 1st message in the stream
-        self.managed_accounts = msg.accountsList.split(",")
+    def managedAccounts(self, accountsList):
+        """Handle managed accounts message from IB API."""
+        self.managed_accounts = accountsList.split(",")
         self._event_managed_accounts.set()
-
-        # Request time to avoid synchronization issues
         self.reqCurrentTime()
 
-    # Request current time
-    def reqCurrentTime(self):
-        """Request current time from IB server.
+    def nextValidId(self, orderId):
+        """Handle next valid order ID message from IB API."""
+        self.orderid = itertools.count(orderId)
 
-        Initiates a request to get the current time from IB server. Used for
-        time synchronization between local clock and IB server time.
-        """
-        self.conn.reqCurrentTime()
-
-    # Current time considering time difference
-    @ibregister
-    def currentTime(self, msg):
-        """Handle current time message from IB API.
-
-        Calculates and stores the time offset between local clock and IB server time.
-        This offset is used to timestamp market data accurately.
-
-        Args:
-            msg: Message containing 'time' field with Unix timestamp from IB server.
-
-        Note:
-            Only processes if timeoffset parameter is True. After calculating offset,
-            schedules a timer to refresh this offset after timerefresh seconds.
-        """
-        if not self.p.timeoffset:  # only if requested ... apply timeoffset
+    def currentTime(self, time_val):
+        """Handle current time message from IB API."""
+        if not self.p.timeoffset:
             return
-        curtime = datetime.fromtimestamp(float(msg.time))
+        curtime = datetime.fromtimestamp(float(time_val))
         with self._lock_tmoffset:
             self.tmoffset = curtime - datetime.now()
 
         threading.Timer(self.p.timerefresh, self.reqCurrentTime).start()
 
-    # Get current time difference or time compensation
-    def timeoffset(self):
-        """Get the current time offset between local clock and IB server time.
+    def contractDetails(self, reqId, contractDetails):
+        """Receive contract details and pass them to the queue."""
+        self.qs[reqId].put(contractDetails)
 
-        Returns:
-            timedelta: Time offset to add to local timestamps to align with IB server time.
+    def contractDetailsEnd(self, reqId):
+        """Signal end of contract details."""
+        self.cancelQueue(self.qs[reqId], True)
+
+    def tickString(self, reqId, tickType, value):
+        """Handle tickString messages from IB API.
+
+        Processes tickType 48 (RTVolume) messages which contain real-time
+        volume data.
         """
+        if tickType == 48:  # RTVolume
+            try:
+                rtvol = RTVolume(value)
+            except ValueError:
+                pass
+            else:
+                self.qs[reqId].put(rtvol)
+
+    def tickPrice(self, reqId, tickType, price, attrib):
+        """Handle tick price for cash markets.
+
+        Cash Markets have no notion of "last_price"/"last_size" and the
+        tracking of the price is done following the BID price (industry
+        de-facto standard with the IB API).
+        """
+        fieldcode = self.iscash.get(reqId, False)
+        if fieldcode:
+            if tickType == fieldcode:
+                try:
+                    if price == -1.0:
+                        return
+                except AttributeError:
+                    pass
+
+                try:
+                    rtvol = RTVolume(price=price, tmoffset=self.tmoffset)
+                except ValueError:
+                    pass
+                else:
+                    self.qs[reqId].put(rtvol)
+
+    def realtimeBar(self, reqId, time_val, open_, high, low, close,
+                    volume, wap, count):
+        """Receives x seconds Real Time Bars (5 seconds supported)."""
+        msg = _MsgNamespace(
+            reqId=reqId,
+            time=datetime.fromtimestamp(float(time_val), UTC),
+            open=open_,
+            high=high,
+            low=low,
+            close=close,
+            volume=volume,
+            wap=wap,
+            count=count,
+        )
+        self.qs[reqId].put(msg)
+
+    def historicalData(self, reqId, bar):
+        """Receives the events of a historical data request."""
+        tickerId = reqId
+        q = self.qs[tickerId]
+
+        msg = _MsgNamespace(
+            reqId=reqId,
+            date=bar.date,
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            volume=bar.volume,
+            barCount=bar.barCount,
+            wap=bar.wap,
+        )
+
+        dtstr = msg.date
+        if self.histfmt[tickerId]:
+            sessionend = self.histsend[tickerId]
+            dt = datetime.strptime(dtstr, "%Y%m%d")
+            dteos = datetime.combine(dt, sessionend)
+            tz = self.histtz[tickerId]
+            if tz:
+                dteostz = tz.localize(dteos)
+                dteosutc = dteostz.astimezone(UTC).replace(tzinfo=None)
+            else:
+                dteosutc = dteos
+
+            if dteosutc <= datetime.now(UTC):
+                dt = dteosutc
+
+            msg.date = dt
+        else:
+            msg.date = datetime.fromtimestamp(long(dtstr), UTC)
+
+        q.put(msg)
+
+    def historicalDataEnd(self, reqId, start, end):
+        """Marks the ending of the historical bars reception.
+
+        In the old IBPy API this was signaled by a bar with date starting
+        with 'finished-'. The new API uses this separate callback instead.
+        """
+        tickerId = reqId
+        q = self.qs[tickerId]
+
+        self.histfmt.pop(tickerId, None)
+        self.histsend.pop(tickerId, None)
+        self.histtz.pop(tickerId, None)
+        kargs = self.histexreq.pop(tickerId, None)
+        if kargs is not None:
+            self.reqHistoricalDataEx(tickerId=tickerId, **kargs)
+            return
+
+        msg = _MsgNamespace(reqId=reqId, date=None)
+        self.cancelQueue(q)
+        q.put(msg)
+
+    def openOrder(self, orderId, contract, order, orderState):
+        """Receive the event ``openOrder`` events."""
+        msg = _MsgNamespace(
+            orderId=orderId,
+            contract=contract,
+            order=order,
+            orderState=_OrderStateAdapter(orderState),
+        )
+        self.broker.push_orderstate(msg)
+
+    def execDetails(self, reqId, contract, execution):
+        """Receive execDetails."""
+        self.broker.push_execution(_ExecutionAdapter(execution))
+
+    def orderStatus(self, orderId, status, filled, remaining, avgFillPrice,
+                    permId, parentId, lastFillPrice, clientId, whyHeld,
+                    mktCapPrice):
+        """Receive the event ``orderStatus``."""
+        msg = _MsgNamespace(
+            orderId=orderId,
+            status=status,
+            filled=filled,
+            remaining=remaining,
+            avgFillPrice=avgFillPrice,
+            permId=permId,
+            parentId=parentId,
+            lastFillPrice=lastFillPrice,
+            clientId=clientId,
+            whyHeld=whyHeld,
+            mktCapPrice=mktCapPrice,
+        )
+        self.broker.push_orderstatus(msg)
+
+    def commissionAndFeesReport(self, commissionAndFeesReport):
+        """Receive the event commissionAndFeesReport."""
+        self.broker.push_commissionreport(
+            _CommissionReportAdapter(commissionAndFeesReport)
+        )
+
+    def updateAccountValue(self, key, val, currency, accountName):
+        """Handle account value update message from IB API."""
+        with self._lock_accupd:
+            try:
+                value = float(val)
+            except ValueError:
+                value = val
+
+            self.acc_upds[accountName][key][currency] = value
+
+            if key == "NetLiquidation":
+                self.acc_value[accountName] = value
+            elif key == "TotalCashBalance" and currency == "BASE":
+                self.acc_cash[accountName] = value
+
+    def updatePortfolio(self, contract, position, marketPrice, marketValue,
+                        averageCost, unrealizedPNL, realizedPNL, accountName):
+        """Handle portfolio update message from IB API."""
+        with self._lock_pos:
+            if not self._event_accdownload.is_set():
+                pos = Position(position, averageCost)
+                self.positions[contract.conId] = pos
+            else:
+                pos = self.positions[contract.conId]
+                if not pos.fix(position, averageCost):
+                    err = (
+                        "The current calculated position and "
+                        "the position reported by the broker do not match. "
+                        "Operation can continue, but the trades "
+                        "calculated in the strategy may be wrong"
+                    )
+                    self.notifs.put((err, (), {}))
+
+                self.broker.push_portupdate()
+
+    def accountDownloadEnd(self, accountName):
+        """Handle account download end message from IB API."""
+        self._event_accdownload.set()
+        if False:
+            if self.port_update:
+                self.broker.push_portupdate()
+                self.port_update = False
+
+    def position(self, account, contract, pos, avgCost):
+        """Receive event positions."""
+        pass  # Not implemented yet
+
+    # ---------------------------------------------------------------
+    # Time offset
+    # ---------------------------------------------------------------
+
+    def timeoffset(self):
+        """Get the current time offset between local clock and IB server."""
         with self._lock_tmoffset:
             return self.tmoffset
 
-    # Next ticker id
+    # ---------------------------------------------------------------
+    # Ticker / Queue management
+    # ---------------------------------------------------------------
+
     def nextTickerId(self):
-        """Generate the next unique ticker ID for data requests.
-
-        Returns:
-            int: The next available ticker ID from the counter starting at REQIDBASE.
-
-        Note:
-            Ticker IDs are used to identify data requests to IB API. REQIDBASE offset
-            ensures data request IDs don't conflict with order IDs.
-        """
-        # Get the next ticker using next on the itertools.count
+        """Generate the next unique ticker ID for data requests."""
         return next(self._tickerId)
 
-    # Next valid order id
-    @ibregister
-    def nextValidId(self, msg):
-        """Handle next valid order ID message from IB API.
-
-        Initializes the order ID counter from the value provided by IB server.
-        This ensures new orders use valid IDs that IB will accept.
-
-        Args:
-            msg: Message containing orderId field with the next valid order ID.
-        """
-        # Create a counter from the TWS notified value to apply to orders
-        self.orderid = itertools.count(msg.orderId)
-
-    # Next order id
     def nextOrderId(self):
-        """Generate the next valid order ID for placing orders.
-
-        Returns:
-            int: The next available order ID from the counter initialized by nextValidId.
-
-        Note:
-            Must wait for nextValidId message from IB before this can be used.
-        """
-        # Get the next ticker using next on the itertools.count made with the
-        # notified value from TWS
+        """Generate the next valid order ID for placing orders."""
         return next(self.orderid)
 
-    # Reuse queue
     def reuseQueue(self, tickerId):
-        """Reuses queue for tickerId, returning the new tickerId and q"""
+        """Reuses queue for tickerId, returning the new tickerId and q."""
         with self._lock_q:
-            # Invalidate tickerId in qs (where it is a key)
-            q = self.qs.pop(tickerId, None)  # invalidate old
+            q = self.qs.pop(tickerId, None)
             iscash = self.iscash.pop(tickerId, None)
 
-            # Update ts: q -> ticker
-            tickerId = self.nextTickerId()  # get new tickerId
-            self.ts[q] = tickerId  # Update ts: q -> tickerId
-            self.qs[tickerId] = q  # Update qs: tickerId -> q
+            tickerId = self.nextTickerId()
+            self.ts[q] = tickerId
+            self.qs[tickerId] = q
             self.iscash[tickerId] = iscash
 
         return tickerId, q
 
-    # Get ticker queue
     def getTickerQueue(self, start=False):
-        """Creates ticker/Queue for data delivery to a data feed"""
+        """Creates ticker/Queue for data delivery to a data feed."""
         q = queue.Queue()
         if start:
             q.put(None)
@@ -1249,49 +952,31 @@ class IBStore(ParameterizedSingletonMixin):
 
         with self._lock_q:
             tickerId = self.nextTickerId()
-            self.qs[tickerId] = q  # can be managed from another thread
+            self.qs[tickerId] = q
             self.ts[q] = tickerId
             self.iscash[tickerId] = False
 
         return tickerId, q
 
-    # Cancel queue
     def cancelQueue(self, q, sendnone=False):
-        """Cancels a Queue for data delivery"""
-        # pop ts (tickers) and with the result qs (queues)
+        """Cancels a Queue for data delivery."""
         tickerId = self.ts.pop(q, None)
         self.qs.pop(tickerId, None)
-
         self.iscash.pop(tickerId, None)
 
         if sendnone:
             q.put(None)
 
-    # Check if queue is valid, return True if queue is in self.ts
     def validQueue(self, q):
-        """Returns (bool) if a queue is still valid"""
-        return q in self.ts  # queue -> ticker
+        """Returns (bool) if a queue is still valid."""
+        return q in self.ts
 
-    # Get detailed contract information
+    # ---------------------------------------------------------------
+    # Contract details
+    # ---------------------------------------------------------------
+
     def getContractDetails(self, contract, maxcount=None):
-        """Get contract details from IB for a given contract.
-
-        Requests and retrieves detailed contract information from IB.
-        Useful for verifying contract specifications before trading.
-
-        Args:
-            contract: IB Contract object to query.
-            maxcount: Optional maximum number of results. If more than one
-                contract is returned and maxcount is not None, the request
-                is considered ambiguous.
-
-        Returns:
-            List of contract detail messages, or None if request is ambiguous
-            or fails. Notification is added to queue if ambiguous.
-
-        Note:
-            Waits for contractDetailsEnd message before returning.
-        """
+        """Get contract details from IB for a given contract."""
         cds = list()
         q = self.reqContractDetails(contract)
         while True:
@@ -1307,34 +992,16 @@ class IBStore(ParameterizedSingletonMixin):
 
         return cds
 
-    # Request contract information
     def reqContractDetails(self, contract):
-        """Request contract details from IB API.
-
-        Args:
-            contract: IB Contract object to query.
-
-        Returns:
-            Queue: Queue for receiving contract detail messages.
-        """
-        # get a ticker/queue for identification/data delivery
+        """Request contract details from IB API."""
         tickerId, q = self.getTickerQueue()
-        self.conn.reqContractDetails(tickerId, contract)
+        EClient.reqContractDetails(self, tickerId, contract)
         return q
 
-    # End of getting contract information
-    @ibregister
-    def contractDetailsEnd(self, msg):
-        """Signal end of contractdetails"""
-        self.cancelQueue(self.qs[msg.reqId], True)
+    # ---------------------------------------------------------------
+    # Historical data requests
+    # ---------------------------------------------------------------
 
-    # Detailed contract information received from TWS
-    @ibregister
-    def contractDetails(self, msg):
-        """Receive an answer and pass it to the queue"""
-        self.qs[msg.reqId].put(msg)
-
-    # Get historical data, method parameters differ from IB's request historical data method
     def reqHistoricalDataEx(
         self,
         contract,
@@ -1348,31 +1015,21 @@ class IBStore(ParameterizedSingletonMixin):
         sessionend=None,
         tickerId=None,
     ):
-        """
-        Extension of the raw reqHistoricalData proxy, which takes two dates
-        rather than a duration, barsize and date
+        """Extension of the raw reqHistoricalData proxy, which takes two dates
+        rather than a duration, barsize and date.
 
         It uses the IB published valid duration/barsizes to make a mapping and
-        spread a historical request over several historical requests if needed
+        spread a historical request over several historical requests if needed.
         """
-        # Keep a copy for error reporting purposes
-        # Get local variables, if contains self, remove it
         kwargs = locals().copy()
-        kwargs.pop("self", None)  # remove self, no need to report it
+        kwargs.pop("self", None)
 
-        # If timeframe is less than seconds, not supported by this function, directly request tick data
         if timeframe < TimeFrame.Seconds:
-            # Ticks are not supported
             return self.getTickerQueue(start=True)
 
-        # If enddate is None, use current time as end time
         if enddate is None:
             enddate = datetime.now()
-        # If begindate is None, request maximum available time length,
-        # If this time length is None, consider no time length for this period, then call function to get tick data
-        # If this time length is not None, calculate barsize
-        # If calculated barsize is None, consider no barsize for this period, then call function to get tick data
-        # If both are not None, call data request function to get specific historical data
+
         if begindate is None:
             duration = self.getmaxduration(timeframe, compression)
             if duration is None:
@@ -1396,34 +1053,27 @@ class IBStore(ParameterizedSingletonMixin):
                 tz=tz,
                 sessionend=sessionend,
             )
-        # Check if IB supports the requested timeframe/compression
-        # Get available data length based on trading period, if time length is None, directly call tick data
+
         durations = self.getdurations(timeframe, compression)
-        if not durations:  # return a queue and put a None in it
+        if not durations:
             return self.getTickerQueue(start=True)
 
-        # Get or reuse a queue
-        # If time period is not None,
-        # If tickerId is None, directly call function to get tickerId and q
-        # If tickerId is not None, call different function to get tickerId and q
         if tickerId is None:
             tickerId, q = self.getTickerQueue()
         else:
-            tickerId, q = self.reuseQueue(tickerId)  # reuse q for old tickerId
+            tickerId, q = self.reuseQueue(tickerId)
 
-        # Get the best possible duration to reduce the number of requests
         duration = None
         for dur in durations:
             intdate = self.dt_plus_duration(begindate, dur)
             if intdate >= enddate:
                 intdate = enddate
-                duration = dur  # begin -> end fits in single request
+                duration = dur
                 break
 
-        if duration is None:  # no duration large enough to fit the request
+        if duration is None:
             duration = durations[-1]
 
-            # Store the calculated data
             self.histexreq[tickerId] = dict(
                 contract=contract,
                 enddate=enddate,
@@ -1441,139 +1091,142 @@ class IBStore(ParameterizedSingletonMixin):
         self.histsend[tickerId] = sessionend
         self.histtz[tickerId] = tz
 
-        if contract.m_secType in ["CASH", "CFD"]:
-            self.iscash[tickerId] = 1  # msg.field code
+        if contract.secType in ["CASH", "CFD"]:
+            self.iscash[tickerId] = 1
             if not what:
-                what = "BID"  # default for cash unless otherwise specified
+                what = "BID"
 
-        elif contract.m_secType in ["IND"] and self.p.indcash:
-            self.iscash[tickerId] = 4  # msg.field code
+        elif contract.secType in ["IND"] and self.p.indcash:
+            self.iscash[tickerId] = 4
 
         what = what or "TRADES"
 
-        self.conn.reqHistoricalData(
+        EClient.reqHistoricalData(
+            self,
             tickerId,
             contract,
-            bytes(intdate.strftime("%Y%m%d %H:%M:%S") + " GMT"),
-            bytes(duration),
-            bytes(barsize),
-            bytes(what),
+            intdate.strftime("%Y%m%d %H:%M:%S") + " GMT",
+            duration,
+            barsize,
+            what,
             int(useRTH),
-            2,
-        )  # dateformat 1 for string, 2 for unix time in seconds
+            2,  # formatDate: 2 for unix time in seconds
+            False,  # keepUpToDate
+            [],  # chartOptions
+        )
 
         return q
 
-    # Request historical data from IB
     def reqHistoricalData(
-        self, contract, enddate, duration, barsize, what=None, useRTH=False, tz="", sessionend=None
+        self, contract, enddate, duration, barsize, what=None,
+        useRTH=False, tz="", sessionend=None
     ):
-        """Proxy to reqHistorical Data"""
-
-        # get a ticker/queue for identification/data delivery
+        """Proxy to reqHistorical Data."""
         tickerId, q = self.getTickerQueue()
 
-        if contract.m_secType in ["CASH", "CFD"]:
+        if contract.secType in ["CASH", "CFD"]:
             self.iscash[tickerId] = True
             if not what:
-                what = "BID"  # TRADES doesn't work
+                what = "BID"
             elif what == "ASK":
                 self.iscash[tickerId] = 2
         else:
             what = what or "TRADES"
 
-        # split barsize "x time", look in sizes for (tf, comp) get tf
         tframe = self._sizes[barsize.split()[1]][0]
         self.histfmt[tickerId] = tframe >= TimeFrame.Days
         self.histsend[tickerId] = sessionend
         self.histtz[tickerId] = tz
 
-        self.conn.reqHistoricalData(
+        EClient.reqHistoricalData(
+            self,
             tickerId,
             contract,
-            bytes(enddate.strftime("%Y%m%d %H:%M:%S") + " GMT"),
-            bytes(duration),
-            bytes(barsize),
-            bytes(what),
+            enddate.strftime("%Y%m%d %H:%M:%S") + " GMT",
+            duration,
+            barsize,
+            what,
             int(useRTH),
-            2,
+            2,  # formatDate: 2 for unix time in seconds
+            False,  # keepUpToDate
+            [],  # chartOptions
         )
 
         return q
 
-    # Cancel data request
     def cancelHistoricalData(self, q):
-        """Cancels an existing HistoricalData request
+        """Cancels an existing HistoricalData request.
 
         Params:
-          - q: the Queue returned by reqMktData
+          - q: the Queue returned by reqHistoricalData
         """
         with self._lock_q:
-            self.conn.cancelHistoricalData(self.ts[q])
+            EClient.cancelHistoricalData(self, self.ts[q])
             self.cancelQueue(q, True)
 
-    # Request real-time bar data, default request is 5 seconds historical data
+    # ---------------------------------------------------------------
+    # Real-time bars
+    # ---------------------------------------------------------------
+
     def reqRealTimeBars(self, contract, useRTH=False, duration=5):
-        """Creates a request for (5 seconds) Real Time Bars
+        """Creates a request for (5 seconds) Real Time Bars.
 
         Params:
-          - contract: a ib.ext.Contract.Contract intance
+          - contract: an ibapi.contract.Contract instance
           - useRTH: (default: False) passed to TWS
-          - duration: (default: 5) passed to TWS, no other value works in 2016)
+          - duration: (default: 5) passed to TWS
 
         Returns:
           - a Queue the client can wait on to receive a RTVolume instance
         """
-        # get a ticker/queue for identification/data delivery
         tickerId, q = self.getTickerQueue()
 
-        # 20150929 - Only 5 secs supported for duration
-        self.conn.reqRealTimeBars(tickerId, contract, duration, bytes("TRADES"), int(useRTH))
+        EClient.reqRealTimeBars(
+            self, tickerId, contract, duration, "TRADES", int(useRTH), []
+        )
 
         return q
 
-    # Cancel request for historical data
     def cancelRealTimeBars(self, q):
-        """Cancels an existing MarketData subscription
+        """Cancels an existing RealTimeBars subscription.
 
         Params:
-          - q: the Queue returned by reqMktData
+          - q: the Queue returned by reqRealTimeBars
         """
         with self._lock_q:
             tickerId = self.ts.get(q, None)
             if tickerId is not None:
-                self.conn.cancelRealTimeBars(tickerId)
+                EClient.cancelRealTimeBars(self, tickerId)
 
             self.cancelQueue(q, True)
 
-    # Request market data
+    # ---------------------------------------------------------------
+    # Market data
+    # ---------------------------------------------------------------
+
     def reqMktData(self, contract, what=None):
-        """Creates a MarketData subscription
+        """Creates a MarketData subscription.
 
         Params:
-          - contract: a ib.ext.Contract.Contract intance
+          - contract: an ibapi.contract.Contract instance
 
         Returns:
           - a Queue the client can wait on to receive a RTVolume instance
         """
-        # get a ticker/queue for identification/data delivery
         tickerId, q = self.getTickerQueue()
         ticks = "233"  # request RTVOLUME tick delivered over tickString
 
-        if contract.m_secType in ["CASH", "CFD"]:
+        if contract.secType in ["CASH", "CFD"]:
             self.iscash[tickerId] = True
             ticks = ""  # cash markets do not get RTVOLUME
             if what == "ASK":
                 self.iscash[tickerId] = 2
 
-        # q.put(None)  # to kickstart backfilling
-        # Can request 233 also for cash ... nothing will arrive
-        self.conn.reqMktData(tickerId, contract, bytes(ticks), False)
+        EClient.reqMktData(self, tickerId, contract, ticks, False, False, [])
         return q
 
-    # Cancel request for market data
     def cancelMktData(self, q):
-        """Cancels an existing MarketData subscription
+        """Cancels an existing MarketData subscription.
 
         Params:
           - q: the Queue returned by reqMktData
@@ -1581,157 +1234,168 @@ class IBStore(ParameterizedSingletonMixin):
         with self._lock_q:
             tickerId = self.ts.get(q, None)
             if tickerId is not None:
-                self.conn.cancelMktData(tickerId)
+                EClient.cancelMktData(self, tickerId)
 
             self.cancelQueue(q, True)
 
-    # Functions related to processing tick data
-    @ibregister
-    def tickString(self, msg):
-        """Handle tickString messages from IB API.
+    # ---------------------------------------------------------------
+    # Order management
+    # ---------------------------------------------------------------
 
-        Processes tickType 48 (RTVolume) messages which contain real-time volume
-        data including price, size, timestamp, and volume-weighted average price.
+    def cancelOrder(self, orderid):
+        """Proxy to cancelOrder."""
+        EClient.cancelOrder(self, orderid, OrderCancel())
 
-        Args:
-            msg: TickString message with tickType and value fields.
+    def placeOrder(self, orderid, contract, order):
+        """Proxy to placeOrder."""
+        EClient.placeOrder(self, orderid, contract, order)
 
-        Note:
-            Only processes tickType 48 (RTVolume). The value field contains
-            semicolon-separated RTVolume data which is parsed by RTVolume class.
+    def reqPositions(self):
+        """Proxy to reqPositions."""
+        EClient.reqPositions(self)
+
+    # ---------------------------------------------------------------
+    # Account management
+    # ---------------------------------------------------------------
+
+    def reqAccountUpdates(self, subscribe=True, account=None):
+        """Proxy to reqAccountUpdates.
+
+        If ``account`` is ``None``, wait for the ``managedAccounts`` message to
+        set the account codes.
         """
-        # Receive and process a tickString message
-        # If try executes normally, else will also execute; if try doesn't execute normally, else won't execute
-        if msg.tickType == 48:  # RTVolume
+        if account is None:
+            self._event_managed_accounts.wait()
+            account = self.managed_accounts[0]
+
+        EClient.reqAccountUpdates(self, subscribe, account)
+
+    def get_acc_values(self, account=None):
+        """Returns all account value infos sent by TWS during regular updates.
+        Waits for at least one successful download.
+        """
+        if self.connected():
+            self._event_accdownload.wait()
+
+        with self._lock_accupd:
+            if account is None:
+                if self.connected():
+                    self._event_managed_accounts.wait()
+
+                if not self.managed_accounts:
+                    return self.acc_upds.copy()
+
+                elif len(self.managed_accounts) > 1:
+                    return self.acc_upds.copy()
+
+                account = self.managed_accounts[0]
+
             try:
-                rtvol = RTVolume(msg.value)
-            except ValueError:  # price doesn't in message ...
+                return self.acc_upds[account].copy()
+            except KeyError:
                 pass
-            else:
-                # Don't need to adjust the time, because it is in "timestamp"
-                # form in the message
-                self.qs[msg.tickerId].put(rtvol)
 
-    # Process tick data for cash market
-    @ibregister
-    def tickPrice(self, msg):
-        """Cash Markets have no notion of "last_price"/"last_size" and the
-        tracking of the price is done (industry de-facto standard at least with
-        the IB API) following the BID price
+            return self.acc_upds.copy()
 
-        A RTVolume which will only contain a price is put into the client's
-        queue to have a consistent cross-market interface
+    def get_acc_value(self, account=None):
+        """Returns the net liquidation value sent by TWS during regular updates.
+        Waits for at least one successful download.
         """
-        # Used for "CASH" markets,
-        # The price field has been seen to be missing in some instances even if
-        # "field" is 1
-        tickerId = msg.tickerId
-        fieldcode = self.iscash[tickerId]
-        if fieldcode:
-            if msg.field == fieldcode:  # Expected cash field code
-                try:
-                    if msg.price == -1.0:
-                        # seems to indicate the stream is halted, for example, in
-                        # between 23:00 - 23:15 CET for FOREX
-                        return
-                except AttributeError:
-                    pass
+        if self.connected():
+            self._event_accdownload.wait()
 
-                try:
-                    rtvol = RTVolume(price=msg.price, tmoffset=self.tmoffset)
-                    # print('rtvol with datetime:', rtvol.datetime)
-                except ValueError:  # price doesn't in message ...
-                    pass
-                else:
-                    self.qs[tickerId].put(rtvol)
+        with self._lock_accupd:
+            if account is None:
+                if self.connected():
+                    self._event_managed_accounts.wait()
 
-    # Get real-time bar information
-    @ibregister
-    def realtimeBar(self, msg):
-        """Receives x seconds Real Time Bars (at the time of writing only 5
-        seconds are supported)
+                if not self.managed_accounts:
+                    return float()
 
-        Not valid for cash markets
+                elif len(self.managed_accounts) > 1:
+                    return sum(self.acc_value.values())
+
+                account = self.managed_accounts[0]
+
+            try:
+                return self.acc_value[account]
+            except KeyError:
+                pass
+
+            return float()
+
+    def get_acc_cash(self, account=None):
+        """Returns the total cash value sent by TWS during regular updates.
+        Waits for at least one successful download.
         """
-        # Get a naive localtime object
-        msg.time = datetime.fromtimestamp(float(msg.time), UTC)
-        self.qs[msg.reqId].put(msg)
+        if self.connected():
+            self._event_accdownload.wait()
 
-    # Get historical data information
-    @ibregister
-    def historicalData(self, msg):
-        """Receives the events of a historical data request"""
-        # For multi-tiered downloads, we'd need to rebind the queue to a new
-        # tickerId (in case tickerIds are not reusable) and instead of putting
-        # None, issue a new reqHistData with the new data and move formward
-        tickerId = msg.reqId
-        q = self.qs[tickerId]
-        if msg.date.startswith("finished-"):
-            self.histfmt.pop(tickerId, None)
-            self.histsend.pop(tickerId, None)
-            self.histtz.pop(tickerId, None)
-            kargs = self.histexreq.pop(tickerId, None)
-            if kargs is not None:
-                self.reqHistoricalDataEx(tickerId=tickerId, **kargs)
-                return
+        with self._lock_accupd:
+            if account is None:
+                if self.connected():
+                    self._event_managed_accounts.wait()
 
-            msg.date = None
-            self.cancelQueue(q)
-        else:
-            dtstr = msg.date  # Format when string req: YYYYMMDD[ HH:MM:SS]
-            if self.histfmt[tickerId]:
-                sessionend = self.histsend[tickerId]
-                dt = datetime.strptime(dtstr, "%Y%m%d")
-                dteos = datetime.combine(dt, sessionend)
-                tz = self.histtz[tickerId]
-                if tz:
-                    dteostz = tz.localize(dteos)
-                    dteosutc = dteostz.astimezone(UTC).replace(tzinfo=None)
-                    # When requesting, for example, daily bars, the current day
-                    # will be returned with the already happened data. If the
-                    # session end were added, the new ticks wouldn't make it
-                    # through because they happen before the end of time
-                else:
-                    dteosutc = dteos
+                if not self.managed_accounts:
+                    return float()
 
-                if dteosutc <= datetime.now(UTC):
-                    dt = dteosutc
+                elif len(self.managed_accounts) > 1:
+                    return sum(self.acc_cash.values())
 
-                msg.date = dt
-            else:
-                msg.date = datetime.fromtimestamp(long(dtstr), UTC)
+                account = self.managed_accounts[0]
 
-        q.put(msg)
+            try:
+                return self.acc_cash[account]
+            except KeyError:
+                pass
 
-    # Get time length for trading period
+            return float()
+
+    def getposition(self, contract, clone=False):
+        """Get position information for a contract."""
+        with self._lock_pos:
+            position = self.positions[contract.conId]
+            if clone:
+                return copy(position)
+
+            return position
+
+    # ---------------------------------------------------------------
+    # Contract creation
+    # ---------------------------------------------------------------
+
+    def makecontract(self, symbol, sectype, exch, curr,
+                     expiry="", strike=0.0, right="", mult=1):
+        """Create an IB Contract object from parameters without validation."""
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = sectype
+        contract.exchange = exch
+        if curr:
+            contract.currency = curr
+        if sectype in ["FUT", "OPT", "FOP"]:
+            contract.lastTradeDateOrContractMonth = expiry
+        if sectype in ["OPT", "FOP"]:
+            contract.strike = strike
+            contract.right = right
+        if mult:
+            contract.multiplier = str(mult)
+        return contract
+
+    # ---------------------------------------------------------------
+    # Duration / size helpers
+    # ---------------------------------------------------------------
+
     def getdurations(self, timeframe, compression):
-        """Get available durations for a given timeframe and compression.
-
-        Args:
-            timeframe: TimeFrame enum value (Seconds, Minutes, Days, etc.).
-            compression: Compression factor (number of time units per bar).
-
-        Returns:
-            list: List of duration strings compatible with the given timeframe/compression.
-                Returns empty list if combination is not supported.
-        """
+        """Get available durations for a given timeframe and compression."""
         key = (timeframe, compression)
         if key not in self.revdur:
             return []
 
         return self.revdur[key]
 
-    # Get maximum time length for trading period
     def getmaxduration(self, timeframe, compression):
-        """Get the maximum duration available for a given timeframe and compression.
-
-        Args:
-            timeframe: TimeFrame enum value (Seconds, Minutes, Days, etc.).
-            compression: Compression factor (number of time units per bar).
-
-        Returns:
-            str or None: Maximum duration string if available, None otherwise.
-        """
+        """Get the maximum duration available for a given timeframe and compression."""
         key = (timeframe, compression)
         try:
             return self.revdur[key][-1]
@@ -1740,18 +1404,8 @@ class IBStore(ParameterizedSingletonMixin):
 
         return None
 
-    # Convert timeframe and compression to barsize
     def tfcomp_to_size(self, timeframe, compression):
-        """Convert timeframe and compression to IB bar size string.
-
-        Args:
-            timeframe: TimeFrame enum value (Seconds, Minutes, Days, Weeks, Months, etc.).
-            compression: Compression factor (number of time units per bar).
-
-        Returns:
-            str or None: IB-compatible bar size string (e.g., "5 mins", "1 day", "1 M").
-                Returns None for unsupported timeframes (Microseconds, Ticks).
-        """
+        """Convert timeframe and compression to IB bar size string."""
         if timeframe == TimeFrame.Months:
             return f"{compression} M"
 
@@ -1774,23 +1428,10 @@ class IBStore(ParameterizedSingletonMixin):
         if timeframe == TimeFrame.Seconds:
             return f"{compression} secs"
 
-        # Microseconds or ticks
         return None
 
-    #
     def dt_plus_duration(self, dt, duration):
-        """Add a duration string to a datetime.
-
-        Args:
-            dt: Base datetime to add duration to.
-            duration: Duration string in format "size dim" where dim is one of:
-                S (seconds), D (days), W (weeks), M (months), Y (years).
-
-        Returns:
-            datetime: New datetime with duration added. For months and years,
-                calculates calendar month/year additions correctly. Returns
-                original dt if duration dimension is not recognized.
-        """
+        """Add a duration string to a datetime."""
         size, dim = duration.split()
         size = int(size)
         if dim == "S":
@@ -1803,438 +1444,73 @@ class IBStore(ParameterizedSingletonMixin):
             return dt + timedelta(days=size * 7)
 
         if dim == "M":
-            month = dt.month - 1 + size  # -1 to make it 0 based, readd below
+            month = dt.month - 1 + size
             years, month = divmod(month, 12)
             return dt.replace(year=dt.year + years, month=month + 1)
 
         if dim == "Y":
             return dt.replace(year=dt.year + size)
 
-        return dt  # could do nothing with it ... return it intact
+        return dt
 
     def calcdurations(self, dtbegin, dtend):
-        """Calculate a duration in between 2 datetimes"""
+        """Calculate a duration in between 2 datetimes."""
         duration = self.histduration(dtbegin, dtend)
 
         if duration[-1] == "M":
             m = int(duration.split()[0])
-            m1 = min(2, m)  # (2, 1) -> 1, (2, 7) -> 2. Bottomline: 1 or 2
-            m2 = max(1, m1)  # m1 can only be 1 or 2
+            m1 = min(2, m)
+            m2 = max(1, m1)
             checkdur = f"{m2} M"
         elif duration[-1] == "Y":
             checkdur = "1 Y"
         else:
             checkdur = duration
-        # todo There is a bug in the code here, changed to the following
-        # sizes = self._durations[checkduration]
         sizes = self._durations[checkdur]
         return duration, sizes
 
-    # Calculate time length and barsize between two times
     def calcduration(self, dtbegin, dtend):
-        """Calculate a duration in between 2 datetimes. Returns single size"""
-        duration, sizes = self._calcdurations(dtbegin, dtend)
+        """Calculate a duration in between 2 datetimes. Returns single size."""
+        duration, sizes = self.calcdurations(dtbegin, dtend)
         return duration, sizes[0]
 
-    # Based on IB historical data API limitations, return smallest possible time length between two dates
     def histduration(self, dt1, dt2):
-        """Calculate the smallest possible duration between two datetimes according to IB's historical data limitations.
-
-        Given two dates, calculates the smallest possible duration string compatible
-        with IB's Historical Data API limitations. This ensures historical data
-        requests use supported duration values.
-
-        Args:
-            dt1: Start datetime.
-            dt2: End datetime.
-
-        Returns:
-            str: Duration string in format "size dim" where dim is one of:
-                S (seconds), D (days), W (weeks), M (months), Y (years).
-
-        Note:
-            IB Historical Data API limitations:
-            * Seconds: 60, 120, 180, 300, 600, 900, 1200, 1800, 3600, 7200, 10800, 14400, 28800
-            * Days: 1, 2
-            * Weeks: 1, 2
-            * Months: 1, 2 (capped from 1-11 to keep table clean)
-            * Years: 1
+        """Calculate the smallest possible duration between two datetimes
+        according to IB's historical data limitations.
         """
-        # Given two dates calculates the smallest possible duration according
-        # to the table from the Historical Data API limitations provided by IB
-        #
-        # Seconds: 'x S' (x: [60, 120, 180, 300, 600, 900, 1200, 1800, 3600,
-        #                     7200, 10800, 14400, 28800])
-        # Days: 'x D' (x: [1, 2]
-        # Weeks: 'x W' (x: [1, 2])
-        # Months: 'x M' (x: [1, 11])
-        # Years: 'x Y' (x: [1])
+        td = dt2 - dt1
 
-        td = dt2 - dt1  # get a timedelta for calculations
-
-        # First: array of secs
         tsecs = td.total_seconds()
-        secs = [60, 120, 180, 300, 600, 900, 1200, 1800, 3600, 7200, 10800, 14400, 28800]
+        secs = [60, 120, 180, 300, 600, 900, 1200, 1800, 3600, 7200,
+                10800, 14400, 28800]
 
         idxsec = bisect.bisect_left(secs, tsecs)
         if idxsec < len(secs):
             return f"{secs[idxsec]} S"
 
-        tdextra = bool(td.seconds or td.microseconds)  # over days/weeks
+        tdextra = bool(td.seconds or td.microseconds)
 
-        # Next: 1 or 2 days
         days = td.days + tdextra
         if td.days <= 2:
             return f"{days} D"
 
-        # Next: 1 or 2 weeks
         weeks, d = divmod(td.days, 7)
         weeks += bool(d or tdextra)
         if weeks <= 2:
             return f"{weeks} W"
 
-        # Get references to dt components
         y2, m2, d2 = dt2.year, dt2.month, dt2.day
         y1, m1, d1 = dt1.year, dt1.month, dt2.day
 
         H2, M2, S2, US2 = dt2.hour, dt2.minute, dt2.second, dt2.microsecond
         H1, M1, S1, US1 = dt1.hour, dt1.minute, dt1.second, dt1.microsecond
 
-        # Next: 1 -> 11 months (11 incl)
-        months = (y2 * 12 + m2) - (y1 * 12 + m1) + ((d2, H2, M2, S2, US2) > (d1, H1, M1, S1, US1))
-        if months <= 1:  # months <= 11
-            return "1 M"  # return '{} M'.format(months)
+        months = (y2 * 12 + m2) - (y1 * 12 + m1) + (
+            (d2, H2, M2, S2, US2) > (d1, H1, M1, S1, US1)
+        )
+        if months <= 1:
+            return "1 M"
         elif months <= 11:
-            return "2 M"  # cap at 2 months to keep the table clean
+            return "2 M"
 
-        # Next: years
-        # y = y2 - y1 + (m2, d2, H2, M2, S2, US2) > (m1, d1, H1, M1, S1, US1)
-        # return '{} Y'.format(y)
-
-        return "1 Y"  # to keep the table clean
-
-    # Create contract as needed
-    def makecontract(self, symbol, sectype, exch, curr, expiry="", strike=0.0, right="", mult=1):
-        """Create an IB Contract object from parameters without validation.
-
-        Args:
-            symbol: Contract symbol (e.g., stock ticker, futures root).
-            sectype: Security type (STK, FUT, OPT, FOP, CASH, etc.).
-            exch: Exchange code (e.g., SMART, NYSE, CME).
-            curr: Currency code (e.g., USD, EUR).
-            expiry: Optional expiration date for futures/options (format: YYYYMM or YYYYMMDD).
-            strike: Optional strike price for options (default: 0.0).
-            right: Optional put/call right for options ('P' or 'C').
-            mult: Optional contract multiplier (default: 1).
-
-        Returns:
-            Contract: IB Contract object populated with the provided parameters.
-        """
-        # returns a contract from the parameters without check
-
-        contract = Contract()
-        contract.m_symbol = bytes(symbol)
-        contract.m_secType = bytes(sectype)
-        contract.m_exchange = bytes(exch)
-        if curr:
-            contract.m_currency = bytes(curr)
-        if sectype in ["FUT", "OPT", "FOP"]:
-            contract.m_expiry = bytes(expiry)
-        if sectype in ["OPT", "FOP"]:
-            contract.m_strike = strike
-            contract.m_right = bytes(right)
-        if mult:
-            contract.m_multiplier = bytes(mult)
-        return contract
-
-    # Cancel order
-    def cancelOrder(self, orderid):
-        """Proxy to cancelOrder"""
-        self.conn.cancelOrder(orderid)
-
-    # Place order
-    def placeOrder(self, orderid, contract, order):
-        """Proxy to placeOrder"""
-        self.conn.placeOrder(orderid, contract, order)
-
-    # Receive openOrder status
-    @ibregister
-    def openOrder(self, msg):
-        """Receive the event ``openOrder`` events"""
-        self.broker.push_orderstate(msg)
-
-    # Receive execution details
-    @ibregister
-    def execDetails(self, msg):
-        """Receive execDetails"""
-        self.broker.push_execution(msg.execution)
-
-    # Receive orderStatus event
-    @ibregister
-    def orderStatus(self, msg):
-        """Receive the event ``orderStatus``"""
-        self.broker.push_orderstatus(msg)
-
-    # Receive commission report event
-    @ibregister
-    def commissionReport(self, msg):
-        """Receive the event commissionReport"""
-        self.broker.push_commissionreport(msg.commissionReport)
-
-    # Request current positions
-    def reqPositions(self):
-        """Proxy to reqPositions"""
-        self.conn.reqPositions()
-
-    # Position, not yet implemented
-    @ibregister
-    def position(self, msg):
-        """Receive event positions"""
-        pass  # Not implemented yet
-
-    # Request account updates
-    def reqAccountUpdates(self, subscribe=True, account=None):
-        """Proxy to reqAccountUpdates
-
-        If ``account`` is ``None``, wait for the ``managedAccounts`` message to
-        set the account codes
-        """
-        if account is None:
-            self._event_managed_accounts.wait()
-            account = self.managed_accounts[0]
-
-        self.conn.reqAccountUpdates(subscribe, bytes(account))
-
-    # Account information update complete
-    @ibregister
-    def accountDownloadEnd(self, msg):
-        """Handle account download end message from IB API.
-
-        Signals that the initial account value download is complete. Sets an event
-        that other code may wait on to ensure account data is available.
-
-        Args:
-            msg: Account download end message from IB API.
-
-        Note:
-            This sets the _event_accdownload event, unblocking any threads waiting
-            for account data to be downloaded.
-        """
-        # Signals the end of an account update
-        # the event indicates it's over. It's only false once, and can be used
-        # to find out if it has at least been downloaded once
-        self._event_accdownload.set()
-        if False:
-            if self.port_update:
-                self.broker.push_portupdate()
-
-                self.port_update = False
-
-    # Update portfolio
-    @ibregister
-    def updatePortfolio(self, msg):
-        """Handle portfolio update message from IB API.
-
-        Updates position information for a contract. Validates that positions
-        calculated locally match what IB reports.
-
-        Args:
-            msg: Portfolio update message containing contract, position, and
-                averageCost fields.
-
-        Note:
-            Thread-safe: uses _lock_pos to synchronize access. On first update
-            (before accountDownloadEnd), creates new Position object. On subsequent
-            updates, validates against existing position. Notification added if
-            positions don't match.
-        """
-        # Lock access to the position dicts. This is called in sub-thread and
-        # can kick in at any time
-        with self._lock_pos:
-            if not self._event_accdownload.is_set():  # 1st event seen
-                position = Position(msg.position, msg.averageCost)
-                self.positions[msg.contract.m_conId] = position
-            else:
-                position = self.positions[msg.contract.m_conId]
-                if not position.fix(msg.position, msg.averageCost):
-                    err = (
-                        "The current calculated position and "
-                        "the position reported by the broker do not match. "
-                        "Operation can continue, but the trades "
-                        "calculated in the strategy may be wrong"
-                    )
-
-                    self.notifs.put((err, (), {}))
-
-                # Flag signal to broker at the end of account download
-                # self.port_update = True
-                self.broker.push_portupdate()
-
-    # Get account position
-    def getposition(self, contract, clone=False):
-        """Get position information for a contract.
-
-        Args:
-            contract: IB Contract object to query.
-            clone: If True, returns a copy of the position object to prevent
-                external modification (default: False).
-
-        Returns:
-            Position: Position object containing size and average cost.
-
-        Note:
-            Thread-safe: uses _lock_pos to synchronize access.
-        """
-        # Lock access to the position dicts.
-        # This is called from the main thread,
-        # and updates could be happening in the background
-        with self._lock_pos:
-            position = self.positions[contract.m_conId]
-            if clone:
-                return copy(position)
-
-            return position
-
-    # Update account value
-    @ibregister
-    def updateAccountValue(self, msg):
-        """Handle account value update message from IB API.
-
-        Updates account value information including cash, net liquidation value,
-        and other account metrics.
-
-        Args:
-            msg: Account value message containing accountName, key, currency, and value fields.
-
-        Note:
-            Thread-safe: uses _lock_accupd to synchronize access. Special handling
-            for NetLiquidation and TotalCashBalance keys to maintain acc_value and
-            acc_cash dictionaries for quick access.
-        """
-        # Lock access to the dicts where values are updated. This happens in a
-        # sub-thread and could kick it at anytime
-        with self._lock_accupd:
-            try:
-                value = float(msg.value)
-            except ValueError:
-                value = msg.value
-
-            self.acc_upds[msg.accountName][msg.key][msg.currency] = value
-
-            if msg.key == "NetLiquidation":
-                # NetLiquidationByCurrency and currency == 'BASE' is the same
-                self.acc_value[msg.accountName] = value
-            elif msg.key == "TotalCashBalance" and msg.currency == "BASE":
-                self.acc_cash[msg.accountName] = value
-
-    # Get all account value information
-    def get_acc_values(self, account=None):
-        """Returns all account value infos sent by TWS during regular updates
-        Waits for at least one successful download
-
-        If ``account`` is `None`, then a dictionary with accounts as keys will
-        be returned containing all accounts
-
-        If the account is specified or the system has only one account, the dictionary
-        corresponding to that account is returned
-        """
-        # Wait for at least 1 account update download to have been finished
-        # before the account infos can be returned to the calling client
-        if self.connected():
-            self._event_accdownload.wait()
-        # Lock access to acc_cash to avoid an event intefering
-        with self._updacclock:
-            if account is None:
-                # wait for the managedAccount Messages
-                if self.connected():
-                    self._event_managed_accounts.wait()
-
-                if not self.managed_accounts:
-                    return self.acc_upds.copy()
-
-                elif len(self.managed_accounts) > 1:
-                    return self.acc_upds.copy()
-
-                # Only 1 account, fall through to return only 1
-                account = self.managed_accounts[0]
-
-            try:
-                return self.acc_upds[account].copy()
-            except KeyError:
-                pass
-
-            return self.acc_upds.copy()
-
-    # Get account net liquidation value
-    def get_acc_value(self, account=None):
-        """Returns the net liquidation value sent by TWS during regular updates
-        Waits for at least one successful download
-
-        If ``account`` is `None`, then a dictionary with accounts as keys will
-        be returned containing all accounts
-
-        If the account is specified or the system has only one account, the dictionary
-        corresponding to that account is returned
-        """
-        # Wait for at least 1 account update download to have been finished
-        # before the value can be returned to the calling client
-        if self.connected():
-            self._event_accdownload.wait()
-        # Lock access to acc_cash to avoid an event intefering
-        with self._lock_accupd:
-            if account is None:
-                # wait for the managedAccount Messages
-                if self.connected():
-                    self._event_managed_accounts.wait()
-
-                if not self.managed_accounts:
-                    return float()
-
-                elif len(self.managed_accounts) > 1:
-                    return sum(self.acc_value.values())
-
-                # Only 1 account, fall through to return only 1
-                account = self.managed_accounts[0]
-
-            try:
-                return self.acc_value[account]
-            except KeyError:
-                pass
-
-            return float()
-
-    # Get account total cash value
-    def get_acc_cash(self, account=None):
-        """Returns the total cash value sent by TWS during regular updates
-        Waits for at least one successful download
-
-        If ``account`` is `None`, then a dictionary with accounts as keys will
-        be returned containing all accounts
-
-        If an account is specified or the system has only one account, the dictionary
-        corresponding to that account is returned
-        """
-        # Wait for at least 1 account update download to have been finished
-        # before the cash can be returned to the calling client
-        if self.connected():
-            self._event_accdownload.wait()
-        # Lock access to acc_cash to avoid an event intefering
-        with self._lock_accupd:
-            if account is None:
-                # wait for the managedAccount Messages
-                if self.connected():
-                    self._event_managed_accounts.wait()
-
-                if not self.managed_accounts:
-                    return float()
-
-                elif len(self.managed_accounts) > 1:
-                    return sum(self.acc_cash.values())
-
-                # Only 1 account, fall through to return only 1
-                account = self.managed_accounts[0]
-
-            try:
-                return self.acc_cash[account]
-            except KeyError:
-                pass
+        return "1 Y"

@@ -22,7 +22,7 @@ Example:
 try:
     from .ibstore import IBStore as IBStore
 except ImportError:
-    pass  # The user may not have ibpy installed
+    pass  # The user may not have ibapi installed
 
 try:
     from .vcstore import VCStore as VCStore
